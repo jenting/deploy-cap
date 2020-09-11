@@ -1,0 +1,520 @@
+#!/bin/bash
+
+set -euo pipefail
+
+DIR="$( cd "$( dirname "$0" )" && pwd )"
+FILES_DIR="$DIR/files"
+cp -n $FILES_DIR/scf-config-values-base.yaml $FILES_DIR/scf-config-values.yaml
+
+# Options
+ACTION=""
+# Default mount path in containers
+MOUNT_PATH="/mnt"
+export HELM_HOME="$FILES_DIR/.helm"
+## Default file path in automation
+STORAGE_CLASS="persistent"
+UAA_CHART_VERSION=""
+SCF_CHART_VERSION=""
+STRATOS_CHART_VERSION=""
+INTERNAL_IP=""
+FLOATING_IP=""
+KUBECONFIG=${KUBECONFIG:-$DIR/../../kubeconfig}
+DEPLOY=false
+
+# Create dir if it does not exist
+if [[ ! -d $HELM_HOME ]]; then
+  mkdir -p $HELM_HOME
+fi
+
+USAGE=$(cat <<USAGE
+Usage:
+
+# SUSE Cloud Application Platform (CAP)
+
+  * Deploy CAP
+
+    --deploy                                  Deploy Cloud Application Platform
+
+  * Test CAP
+
+    --test                                    Run tests on Cloud Application Platform
+
+  * Destroy CAP
+
+    --destroy                                Destroy the Cloud Application Platform deployment
+
+* General Options
+
+    --deploy-server                          Deploy the server part when used with --test-volumetype (see example 2)
+    --uaa-chart-version                      UAA helm chart version, use latest if not specified
+    --scf-chart-version                      SCF helm chart version, use latest if not specified
+    --stratos-chart-version                  STRATOS helm chart version, use latest if not specified
+    --storage-class                          'persistent' name of the storage class to use for persistent storage
+    -k|--kubeconfig      <FNAME>             'kubeconfig' file path (\$KUBECONFIG)
+    --internal-ip        <IP>                Internal interface IP (e.g 172.16.0.1)
+    --floating-ip        <IP>                For OpenStack, use the floating IP for the UAA DOMAIN (e.g 10.86.0.2)
+
+  * Examples:
+
+  $0 --deploy -k kubeconfig --internal-ip 10.84.72.211 --storage-class ses6-rbd-dev
+  $0 --deploy -k kubeconfig --internal-ip 172.16.0.1 --external-ip 10.86.0.2 --storage-class cinder
+  $0 --test -k kubeconfig
+    # is the same as:
+  $0 --test -ds -k kubeconfig
+
+  $0 --destroy -k kubeconfig
+
+# Requirements:
+ - 'kubeconfig' file
+ - 'kubectl' executable in path
+ - 'helm' executable in path
+ - 'jq' executable in path
+ - 'cf' executable in path
+ 
+USAGE
+)
+
+# Utility methods
+log()        { (>&2 echo -e ">>> [cap-deploy] $@"); }
+log_info()   { log "INFO: $@"; }
+log_action() { log "ACTION: $@ ($(date '+%Y-%m-%d %H:%M:%S'))" 2>&1 |tee -a tests.log; }
+
+log_test_info()    { log "TEST_INFO: $@" 2>&1 |tee -a tests.log; }
+log_test_result()  {
+  if [ $1 == true ]; then
+    log "TEST_RESULT: SUCCESS" 2>&1 |tee -a tests.log
+  else
+    log "TEST_RESULT: FAILED" 2>&1 |tee -a tests.log
+  fi
+}
+
+check_result() {
+  if [ $1 -eq 0 ]; then
+    log_test_result true; return 0
+  else
+    log_test_result false; return 1
+  fi
+}
+
+log_warn()       { log "WARNING: $@" ; }
+log_error()      { log "ERROR: $@" ; exit 1 ; }
+check_file() { if [ ! -f $1 ]; then error "File $1 doesn't exist!"; fi }
+
+# Parse options
+while [[ $# > 0 ]] ; do
+  case $1 in
+    --deploy)
+      ACTION="deploy"
+      ;;
+    --destroy)
+      ACTION="destroy"
+      ;;
+    --test)
+      ACTION="test"
+      ;;
+    --internal-ip)
+      INTERNAL_IP="$2"
+      shift
+      ;;
+    --floating-ip)
+      FLOATING_IP="$2"
+      shift
+      ;;
+    --storage-class)
+      STORAGE_CLASS="$2"
+      shift
+      ;;
+    --uaa-chart-version)
+      UAA_CHART_VERSION="$2"
+      shift
+      ;;
+    --scf-chart-version)
+      SCF_CHART_VERSION="$2"
+      shift
+      ;;
+    --stratos-chart-version)
+      STRATOS_CHART_VERSION="$2"
+      shift
+      ;;
+    -k|--kubeconfig)
+      KUBECONFIG="$2"
+      shift
+      ;;
+    --deploy-server)
+      DEPLOY=true
+      ;;
+    -h|--help)
+      echo "$USAGE"
+      exit 0
+      ;;
+  esac
+  shift
+done
+
+# Common functions
+
+# Wait until a specific workload resource is ready
+wait_until_ready() {
+  # Requires $target_num $timeout
+  case $1 in
+    ds|daemonsets)
+      resource="daemonsets"
+      ready_column="2"
+      ;;
+    deploy|deployments)
+      resource="deployments"
+      ready_column="2"
+      ;;
+    po|pods)
+      resource="pods"
+      ready_column="2"
+      ;;
+    sts|statefulsets)
+      resource="statefulsets"
+      ready_column="2"
+      ;;
+  esac
+
+  namespace=${2:-default}
+  timeout=${3:-600}
+
+  if [[ $resource != "pods" ]]; then
+    target_num=$( kget $resource $NAME -n $namespace | awk '{print $2}' )
+  fi
+
+  for elapsed in $(seq 0 $timeout); do
+    log_info "[$elapsed / $timeout] checking $resource/$NAME in namespace $namespace"
+    current_available_num=$( kget $resource $NAME -n $namespace | awk "{print $"$ready_column"}" )
+
+    if [[ $resource == "pods" ]]; then
+      # Exit if all containers in the pod have terminated in success
+      pod_status=$( kget $resource $NAME -n $namespace | awk '{print $3}' )
+      [[ $pod_status == "Completed" || $pod_status == "Succeeded" ]] && return
+
+      # Parse READY column from pod n/n
+      pod_ready_status=$current_available_num
+      current_available_num=$(echo $pod_ready_status | awk -F'/' '{print $1}')
+      target_num=$(echo $pod_ready_status | awk -F'/' '{print $2}')
+    fi
+
+    log_info "current: $current_available_num / $target_num"
+    [[ $current_available_num -eq "$target_num" ]] && log_info "ready" && return
+    log_info "not ready yet"
+    sleep 1
+  done
+  log_error "$current_available_num instances running. Expected: $target_num"
+  return 1
+}
+
+# Wait until all workload resources are ready in a namespace
+# It is a wrapper around wait_until_ready
+wait_until_all_ns_ready() {
+  resources="daemonsets deployments statefulsets pods"
+  namespace=${1:-default}
+  timeout=${2:-3200}
+
+  for resource in $resources; do
+    resources_found=$(kget $resource -n $namespace | awk '{print $1}')
+    if [[ $resources_found ]]; then
+      for rsc in $resources_found; do
+        NAME=$rsc && wait_until_ready $resource $namespace $timeout
+      done
+    fi
+  done
+}
+
+# Wait until a pod or a namespace id deleted
+wait_until_deleted() {
+  case $1 in
+    po|pods)
+      resource="pods"
+      status_column="3"
+      ;;
+    ns|namespaces)
+      resource="namespaces"
+      status_column="2"
+      ;;
+  esac
+  namespace=${2:-default}
+  timeout=${3:-600}
+
+  for elapsed in $(seq 0 $timeout); do
+    log_info "[$elapsed / $timeout] waiting for $resource $NAME to be deleted"
+    current_status=$( kget $resource -n $namespace --ignore-not-found=true | grep $NAME | awk "{print $"$status_column"}" ) && log_info "current status: $current_status"
+    [[ -z $current_status ]] && log_info "current status: deleted" && return
+    sleep 1
+  done
+  log_error "$resource $NAME is in the state $current_status. Expected to be null (deleted)"
+  return 1
+}
+
+apply_manifest() {
+  log_info "running: kubectl apply -f $@"
+  kubectl --kubeconfig="$KUBECONFIG" apply -f $@
+}
+
+delete_manifest() {
+  log_info "running: kubectl delete -f $@"
+  kubectl --kubeconfig="$KUBECONFIG" delete -f $@ --all=true
+}
+
+kdescribe() {
+  log_info "running: kubectl describe $@"
+  kubectl --kubeconfig="$KUBECONFIG" describe $@
+}
+
+kget() {
+  log_info "running: kubectl get --no-headers -owide $@"
+  kubectl --kubeconfig="$KUBECONFIG" get --no-headers -owide $@
+}
+
+kexec() {
+  log_info "running: kubectl exec $@"
+  kubectl --kubeconfig="$KUBECONFIG" exec "$@"
+}
+
+kdelete() {
+  log_info "running: kubectl delete --force $@"
+  kubectl --kubeconfig="$KUBECONFIG" delete --force $@
+}
+
+# Find a working wildcard domain service
+get_wildcard_domain() {
+  # Test the wildcard on localhost
+  domain=
+  for dns in omg.howdoi.website xip.io nip.io lvh.me; do
+    if ping -c 3 127.0.0.1.$dns > /dev/null 2>&1; then
+      log_info "testing wildcard domain: $dns"
+      WILDCARD_DOMAIN=$dns && log_info "using wildcard domain: $WILDCARD_DOMAIN"
+      return
+    else
+      log_warn "$dns not available, checking next..."
+    fi
+  done
+
+  if [[ -z $WILDCARD_DOMAIN ]]; then
+    log_error "no wildcard domain available, aborting" && abort
+  fi
+}
+
+# Test URL based on response status code
+check_url() {
+  url=$1
+
+  retcode=$(curl -I -s -o /dev/null -w "%{http_code}" $url)
+  if [[ $retcode == 200 || $retcode == 201 || $retcode == 202 ]]; then
+    log_info "URL OK, status code: $retcode"
+    return 0
+  else
+    log_info "URL NOK, status code: $retcode"
+    return 1
+  fi
+}
+
+configure_helm() {
+  # check if helm command exist
+  if ! hash helm3 > /dev/null 2>&1; then
+    log_error "helm3 does not exist" && abort
+  fi
+
+  suse_repo="https://kubernetes-charts.suse.com/"
+  if helm3 repo list | grep $suse_repo; then
+    log_info "suse chart repository already added"
+  else
+    log_info "adding suse chart repository"
+    helm3 repo add suse https://kubernetes-charts.suse.com/
+  fi
+
+  log_info "update repository"
+  helm3 repo update
+
+  log_info "repository list:"
+  helm3 repo list
+
+  log_info "available suse charts:"
+  helm3 search repo suse
+}
+
+###########
+### CAP ###
+###########
+deploy() {
+  log_action "DEPLOY CAP"
+
+  # Configure helm
+  configure_helm
+
+  # Generate a password
+  if [[ ! -s "$FILES_DIR/password" ]]; then
+    uuidgen > "$FILES_DIR/password"
+  fi
+  password=$(cat $FILES_DIR/password)
+
+  if [[ -z "$INTERNAL_IP" ]]; then
+    log_error "No Internal IP provided" && abort
+  fi
+
+  # Get a wildcard domain, return $WILDCARD_DOMAIN
+  get_wildcard_domain
+
+  # For OpenStack, we have to use the floating IP (external_ip) that
+  # points to the worker node
+  if [[ ! -z "$FLOATING_IP" ]]; then
+    domain="$FLOATING_IP.$WILDCARD_DOMAIN"
+  else
+    domain="$INTERNAL_IP.$WILDCARD_DOMAIN"
+  fi
+
+  node=$(kubectl get nodes  -o json | jq ".items[] | {name: .metadata.name, ip: .status.addresses[] | select(.type==\"InternalIP\") | select(.address==\"$INTERNAL_IP\")}" | jq -r '.name')
+
+  # Configure scf-config-values.yaml
+  # Add secrets
+  sed -i "s/UAA_ADMIN_CLIENT_SECRET:.*/UAA_ADMIN_CLIENT_SECRET: $password/" $FILES_DIR/scf-config-values.yaml
+  sed -i "s/CLUSTER_ADMIN_PASSWORD:.*/CLUSTER_ADMIN_PASSWORD: $password/" $FILES_DIR/scf-config-values.yaml
+
+  # Add storage class
+  sed -i "s/persistent:.*/persistent: $STORAGE_CLASS/" $FILES_DIR/scf-config-values.yaml
+
+  # Replace values in config file
+  sed -i "s/DOMAIN:.*/DOMAIN: $domain/" $FILES_DIR/scf-config-values.yaml
+  sed -i "s/UAA_HOST:.*/UAA_HOST: uaa.$domain/" $FILES_DIR/scf-config-values.yaml
+  sed -i "s/external_ips:.*/external_ips: \[\"$INTERNAL_IP\"\]/" $FILES_DIR/scf-config-values.yaml
+
+  log_info "worker node: $node"
+  log_info "worker internal IP: $INTERNAL_IP"
+  log_info "worker floating IP (OpenStack only): $FLOATING_IP"
+
+  log_info "scf-config-values.yaml content:"
+  cat $FILES_DIR/scf-config-values.yaml
+
+  log_info "creating uaa,scf and stratos namespaces"
+  apply_manifest $FILES_DIR/cap-namespaces.yaml
+
+  # Deploy UAA
+  log_info "helm: deploying UAA"
+  if ! helm3 list -n uaa | grep uaa; then
+    helm3 install uaa suse/uaa --namespace uaa --create-namespace \
+        --values $FILES_DIR/scf-config-values.yaml \
+        ${UAA_CHART_VERSION:+--version $UAA_CHART_VERSION}
+  fi
+  wait_until_all_ns_ready uaa
+
+  # Get UAA CA CERT
+  SECRET=$(kget pods --namespace uaa -o jsonpath='{.items[*].spec.containers[?(.name=="uaa")].env[?(.name=="INTERNAL_CA_CERT")].valueFrom.secretKeyRef.name}' | awk '{ print $1 }')
+  CA_CERT="$(kget secret $SECRET --namespace uaa -o jsonpath="{.data['internal-ca-cert']}" | base64 --decode -)"
+
+  # Deploy SCF
+  log_info "helm: deploying SCF"
+  if ! helm3 list -n scf | grep scf; then
+    helm3 install scf suse/cf --namespace scf --create-namespace \
+        --values $FILES_DIR/scf-config-values.yaml \
+        --set "secrets.UAA_CA_CERT=${CA_CERT}" \
+        ${SCF_CHART_VERSION:+--version $SCF_CHART_VERSION}
+  fi
+  wait_until_all_ns_ready scf 3200
+
+
+  # Deploy STRATOS
+  log_info "helm: deploying STRATOS"
+  if ! helm3 list -n stratos | grep stratos; then
+    helm3 install stratos suse/console --namespace stratos --create-namespace \
+        --values $FILES_DIR/scf-config-values.yaml \
+        --set "storageClass=$STORAGE_CLASS" \
+        ${STRATOS_CHART_VERSION:+--version $STRATOS_CHART_VERSION}
+  fi
+  wait_until_all_ns_ready stratos
+}
+
+test_cap() {
+  # check if cf command exist
+  if ! hash cf > /dev/null 2>&1; then
+    log_error "cf does not exist" && abort
+  fi
+
+  # Deploy CAP
+  if [[ $DEPLOY == true ]];then
+    deploy
+  fi
+
+  log_action "TEST CAP"
+
+  # Default values
+  domain=$(grep "DOMAIN:" $FILES_DIR/scf-config-values.yaml | awk '{print $2}')
+  password=$(grep "CLUSTER_ADMIN_PASSWORD:" $FILES_DIR/scf-config-values.yaml | awk '{print $2}')
+  space="qa_deploy"
+
+  php_app="test-app-php"
+
+  # Login
+  log_info "logging to the API"
+  cf login --skip-ssl-validation -a https://api.$domain -u admin -p $password
+
+  # Create and use the space
+  log_info "creating space: $space"
+  cf create-space $space
+
+  log_info "targeting the space: $space"
+  cf target -o system -s $space
+
+  # Deploy an application
+  for app in $php_app; do
+    # Extract application
+    tar --overwrite -zxf "$FILES_DIR/$app.tgz" -C "$FILES_DIR"
+
+    # Push app
+    log_info "pushing app: $app"
+    cf app $app > /dev/null 2>&1 || cf push "$app" -p "$FILES_DIR/$app"
+
+    # Show app
+    app=$(cf app $app)
+    appurl=$(echo -e "$app" | grep -E  "^routes.*" | awk '{print $2}')
+    log_info "application url: $appurl"
+
+    # Test we can access to the app
+    log_test_info "trying to fetch url: $appurl"
+    check_url $appurl && check_result $? || check_result $?
+  done
+
+  log_info "show running apps"
+  cf apps
+}
+
+destroy() {
+  names="uaa scf stratos"
+
+  log_action "DESTROY CAP"
+
+  log_info "deleting namespaces $names"
+  delete_manifest $FILES_DIR/cap-namespaces.yaml
+  for name in $names; do
+    NAME=$name && wait_until_deleted namespaces
+  done
+
+  log_info "helm: deleting $names"
+  helm3 delete $names -n $names
+}
+
+# Check if commands exist
+for cmd in "kubectl helm3 jq"; do
+  if ! hash $cmd > /dev/null 2>&1; then
+    log_error "$cmd does not exist, aborting..." && abort
+  fi
+done
+
+case "$ACTION" in
+  "deploy")
+    deploy
+    ;;
+  "destroy")
+    destroy
+    ;;
+  "test")
+    test_cap
+    ;;
+  *)
+    echo "$USAGE"
+    exit 1
+    ;;
+esac
+
+log_info "Done"
